@@ -163,6 +163,30 @@ async def generate_reply(user_text: str) -> str:
     return await _groq_call(system, user_text, max_tokens=200, temperature=0.85)
 
 
+async def transcribe_voice(client, message) -> str | None:
+    """Скачивает голосовое сообщение и транскрибирует через Groq Whisper."""
+    import os
+    from groq import AsyncGroq
+
+    path = None
+    try:
+        path = await message.download()
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        with open(path, "rb") as f:
+            resp = await groq_client.audio.transcriptions.create(
+                file=(os.path.basename(path), f),
+                model="whisper-large-v3",
+                language="ru",
+            )
+        return resp.text.strip() or None
+    except Exception as e:
+        log.error("transcribe_voice error: %s", e)
+        return None
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 # ── Вступление в канал и группу обсуждений ───────────────────────────────────
 async def join_channel_and_discussion(client, username: str) -> tuple[bool, str]:
     """
@@ -221,10 +245,27 @@ async def handle_admin_message(client, message) -> None:
 
     # ── Если не в сессии — отвечаем как AI-собеседник ────────────────────────
     if not admin_sessions.get(user_id):
-        if not text:
+        has_voice = bool(message.voice)
+        if not text and not has_voice:
             return
+
+        from pyrogram.enums import ChatAction
+
+        # Прочитать через 2 сек, потом печатать и отвечать
+        await asyncio.sleep(2)
+        await client.read_chat_history(message.chat.id)
+        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+
         try:
-            reply = await generate_reply(text)
+            if has_voice:
+                input_text = await transcribe_voice(client, message)
+                if not input_text:
+                    await message.reply("не смог распознать голосовое")
+                    return
+            else:
+                input_text = text
+
+            reply = await generate_reply(input_text)
             await message.reply(reply)
         except Exception as e:
             log.error("generate_reply error: %s", e)
