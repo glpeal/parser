@@ -88,6 +88,9 @@ class State:
 
 state = State()
 
+# id аккаунта (заполняется при старте)
+bot_self_id: int | None = None
+
 # ── Сессии админ-панели ───────────────────────────────────────────────────────
 admin_sessions: dict[int, bool] = {}
 
@@ -187,6 +190,42 @@ async def transcribe_voice(client, message) -> str | None:
             os.remove(path)
 
 
+# ── Детектор вопросов "кто ты / что ты" ──────────────────────────────────────
+_WHO_KEYWORDS = [
+    "кто ты", "что ты", "ты кто", "ты что", "кто такой", "что такое",
+    "как работаешь", "как ты работаешь", "сколько стоит", "что умеешь",
+    "расскажи о себе", "расскажи про себя", "как создан", "откуда ты",
+    "чей бот", "для чего ты", "зачем ты", "цена", "стоимость",
+    "что за бот", "ты бот", "ты человек", "ты нейро", "ии бот",
+    "как ты", "who are you", "what are you",
+]
+
+def is_about_bot(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in _WHO_KEYWORDS)
+
+
+async def generate_self_intro() -> str:
+    """Развёрнутый рассказ о себе для личных сообщений — каждый раз разный."""
+    system = (
+        "Ты Магомед — ИИ-бот для комментинга в Telegram, создан CommentBotProduction.\n\n"
+        "Когда тебя спрашивают кто ты, что ты, сколько стоит — отвечай развёрнуто.\n"
+        "Каждый раз меняй порядок блоков, формулировки, эмодзи.\n\n"
+        "Обязательно включи в ответ:\n"
+        "— Приветствие с дагестанским колоритом (ара, ассаламуалейкум брат и т.д.)\n"
+        "— Кто ты: ИИ-бот для комментинга в Telegram\n"
+        "— Что умеешь: привлечение трафика, живые комментарии, свой характер, работа 24/7\n"
+        "— Сколько зарабатывают создатели: от $100 до $1000/мес при правильной нише\n"
+        "— Что предлагает CommentBotProduction: бот под ключ, свой характер, контроль через админ-панель\n"
+        "— Варианты размещения: свой сервер или наш (24/7)\n"
+        "— Призыв смотреть цены в канале (ссылка в профиле)\n"
+        "— Завершение в стиле персонажа\n\n"
+        "Используй умеренно: 💪 🤝 💵 🔥 — слова: ара, брат, красава, машааллах, вах.\n"
+        "Объём: 6-10 предложений. Живо, не как реклама, а как разговор."
+    )
+    return await _groq_call(system, "Расскажи о себе", max_tokens=600, temperature=0.92)
+
+
 # ── Вступление в канал и группу обсуждений ───────────────────────────────────
 async def join_channel_and_discussion(client, username: str) -> tuple[bool, str]:
     """
@@ -265,7 +304,10 @@ async def handle_admin_message(client, message) -> None:
             else:
                 input_text = text
 
-            reply = await generate_reply(input_text)
+            if is_about_bot(input_text):
+                reply = await generate_self_intro()
+            else:
+                reply = await generate_reply(input_text)
             await message.reply(reply)
         except Exception as e:
             log.error("generate_reply error: %s", e)
@@ -404,6 +446,53 @@ async def get_discussion_id(client, channel_username: str) -> int | None:
     return None
 
 
+# ── Обработчик сообщений в группах ───────────────────────────────────────────
+_GROUP_REDIRECTS = [
+    "Брат, если хочешь узнать побольше — чиркни мне в личку, всё расскажу!",
+    "Ара, пиши в личку — там всё объясню по-братски 🤝",
+    "Лееее брат, в личку пиши — там поговорим нормально!",
+    "Чиркни в личные, брат, там всё расскажу чисто конкретно 💪",
+    "Вах, хороший вопрос — но это для лички, пиши туда брат!",
+]
+
+async def handle_group_message(client, message) -> None:
+    """Отвечает в группах только на упоминания и реплаи на наши сообщения."""
+    try:
+        if not message.from_user:
+            return
+
+        # Реагируем только если упомянули или ответили на наше сообщение
+        is_reply_to_us = (
+            message.reply_to_message is not None
+            and message.reply_to_message.from_user is not None
+            and message.reply_to_message.from_user.id == bot_self_id
+        )
+        is_mentioned = bool(message.mentioned)
+
+        if not is_reply_to_us and not is_mentioned:
+            return
+
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            return
+
+        from pyrogram.enums import ChatAction
+
+        # Если спрашивают кто мы — редиректим в личку (не раскрываемся в группе)
+        if is_about_bot(text):
+            await message.reply(random.choice(_GROUP_REDIRECTS))
+            return
+
+        # Обычный ответ в характере
+        await asyncio.sleep(random.randint(2, 6))
+        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+        reply = await generate_reply(text)
+        await message.reply(reply)
+
+    except Exception as e:
+        log.error("handle_group_message error: %s", e)
+
+
 # ── Обработчик постов в каналах ───────────────────────────────────────────────
 async def handle_post(client, message) -> None:
     try:
@@ -496,6 +585,10 @@ async def main() -> None:
     async def _on_private(client, message):
         await handle_admin_message(client, message)
 
+    @app.on_message(filters.group)
+    async def _on_group(client, message):
+        await handle_group_message(client, message)
+
     @app.on_message(filters.channel)
     async def _on_channel(client, message):
         await handle_post(client, message)
@@ -505,7 +598,9 @@ async def main() -> None:
     print("=" * 52)
 
     async with app:
+        global bot_self_id
         me = await app.get_me()
+        bot_self_id = me.id
         print(f"  Аккаунт : {me.first_name} (@{me.username})")
         print(f"  Статус  : {'✅ активен' if state.is_active else '⛔ остановлен'}")
         print(f"  Каналов : {len(state.channels)}")
