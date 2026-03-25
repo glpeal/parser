@@ -101,7 +101,8 @@ MENU = """🤖 Панель управления
 
 # ── Groq: генерация комментария ───────────────────────────────────────────────
 async def generate_comment(post_text: str) -> str:
-    """Генерирует живой комментарий через Groq (llama-3.3-70b-versatile)."""
+    """Генерирует короткий живой комментарий через Groq (llama-3.3-70b-versatile)."""
+    import re
     from groq import AsyncGroq
 
     client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -111,10 +112,11 @@ async def generate_comment(post_text: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "Пиши живые, естественные комментарии на русском языке под постами в Telegram. "
-                    "1–3 предложения. Никаких шаблонных фраз («отличный пост», «спасибо за информацию», «интересно»). "
-                    "Добавляй своё мнение, аргумент или задавай уместный вопрос. "
-                    "Соответствуй тону поста: если пост серьёзный — серьёзно, если лёгкий — живо."
+                    "Пиши короткие живые комментарии на русском языке под постами в Telegram. "
+                    "Максимум одно короткое предложение или фраза — не более 10 слов. "
+                    "Никаких знаков препинания: без точек запятых восклицательных и вопросительных знаков тире скобок кавычек. "
+                    "Никаких шаблонных фраз. Своё мнение или реакция по теме поста. "
+                    "Пиши как живой человек в чате — коротко и по делу."
                 ),
             },
             {
@@ -122,10 +124,53 @@ async def generate_comment(post_text: str) -> str:
                 "content": f"Напиши комментарий к посту:\n\n{post_text[:1000]}",
             },
         ],
-        max_tokens=200,
-        temperature=0.8,
+        max_tokens=60,
+        temperature=0.9,
     )
-    return resp.choices[0].message.content.strip()
+    comment = resp.choices[0].message.content.strip()
+    # Удаляем знаки препинания на случай если модель всё равно добавила
+    comment = re.sub(r'[.!?,;:…\-—–()\[\]{}"\'«»]', '', comment).strip()
+    return comment
+
+
+# ── Вступление в канал и группу обсуждений ───────────────────────────────────
+async def join_channel_and_discussion(client, username: str) -> tuple[bool, str]:
+    """
+    Вступает в канал и в его группу обсуждений (linked_chat).
+    Возвращает (успех, описание).
+    """
+    from pyrogram import errors as pyro_errors
+
+    lines = []
+    try:
+        await client.join_chat(username)
+        lines.append(f"вступил в канал @{username}")
+    except pyro_errors.UserAlreadyParticipant:
+        lines.append(f"уже в канале @{username}")
+    except Exception as e:
+        return False, str(e)
+
+    # Получаем linked_chat (группа обсуждений)
+    try:
+        chat = await client.get_chat(username)
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            discussion_id = linked.id
+            try:
+                await client.join_chat(discussion_id)
+                discussion_title = getattr(linked, "title", str(discussion_id))
+                lines.append(f"вступил в чат обсуждений «{discussion_title}»")
+            except pyro_errors.UserAlreadyParticipant:
+                discussion_title = getattr(linked, "title", str(discussion_id))
+                lines.append(f"уже в чате обсуждений «{discussion_title}»")
+            except Exception as e:
+                lines.append(f"не удалось вступить в чат обсуждений: {e}")
+        else:
+            lines.append("группа обсуждений не найдена")
+    except Exception as e:
+        lines.append(f"ошибка получения linked_chat: {e}")
+
+    return True, "\n".join(lines)
 
 
 # ── Обработчик личных сообщений (админ-панель) ────────────────────────────────
@@ -166,9 +211,16 @@ async def handle_admin_message(client, message) -> None:
         elif ch in state.channels:
             await message.reply(f"⚠️ @{ch} уже есть в списке")
         else:
-            state.channels.append(ch)
-            state.save()
-            await message.reply(f"✅ @{ch} добавлен\nВсего каналов: {len(state.channels)}")
+            await message.reply(f"⏳ Вступаю в @{ch}...")
+            joined, detail = await join_channel_and_discussion(client, ch)
+            if not joined:
+                await message.reply(f"❌ Не удалось вступить в @{ch}: {detail}")
+            else:
+                state.channels.append(ch)
+                state.save()
+                await message.reply(
+                    f"✅ @{ch} добавлен\n{detail}\nВсего каналов: {len(state.channels)}"
+                )
 
     # ── /remove @channel ──────────────────────────────────────────────────────
     elif text.startswith("/remove "):
