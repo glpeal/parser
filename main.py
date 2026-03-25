@@ -49,6 +49,7 @@ class State:
         self.admin_id: int | None = None
         self.min_delay: int       = 30
         self.max_delay: int       = 120
+        self.character: str | None = None  # кастомный промпт персонажа
 
     def save(self):
         STATE_FILE.write_text(
@@ -59,6 +60,7 @@ class State:
                     "admin_id":  self.admin_id,
                     "min_delay": self.min_delay,
                     "max_delay": self.max_delay,
+                    "character": self.character,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -70,11 +72,12 @@ class State:
         if STATE_FILE.exists():
             try:
                 d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                self.is_active = d.get("is_active", False)
-                self.channels  = d.get("channels", [])
-                self.admin_id  = d.get("admin_id")
-                self.min_delay = d.get("min_delay", 30)
-                self.max_delay = d.get("max_delay", 120)
+                self.is_active  = d.get("is_active", False)
+                self.channels   = d.get("channels", [])
+                self.admin_id   = d.get("admin_id")
+                self.min_delay  = d.get("min_delay", 30)
+                self.max_delay  = d.get("max_delay", 120)
+                self.character  = d.get("character")
                 log.info(
                     "Состояние загружено: активен=%s, каналов=%d",
                     self.is_active, len(self.channels),
@@ -96,36 +99,108 @@ MENU = """🤖 Панель управления
 /start — начать комментинг
 /stop — остановить
 /delay 30 120 — задержка (мин макс секунд)
-/list — список каналов"""
+/list — список каналов
+/character add <prompt> — задать характер (на англ.)
+/character remove — сбросить характер"""
 
 
-# ── Groq: генерация комментария ───────────────────────────────────────────────
-async def generate_comment(post_text: str) -> str:
-    """Генерирует живой комментарий через Groq (llama-3.3-70b-versatile)."""
+# ── Groq: общий вызов ─────────────────────────────────────────────────────────
+async def _groq_call(system: str, user: str, max_tokens: int = 60, temperature: float = 0.9) -> str:
     from groq import AsyncGroq
-
     client = AsyncGroq(api_key=GROQ_API_KEY)
     resp = await client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Пиши живые, естественные комментарии на русском языке под постами в Telegram. "
-                    "1–3 предложения. Никаких шаблонных фраз («отличный пост», «спасибо за информацию», «интересно»). "
-                    "Добавляй своё мнение, аргумент или задавай уместный вопрос. "
-                    "Соответствуй тону поста: если пост серьёзный — серьёзно, если лёгкий — живо."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Напиши комментарий к посту:\n\n{post_text[:1000]}",
-            },
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
         ],
-        max_tokens=200,
-        temperature=0.8,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
     return resp.choices[0].message.content.strip()
+
+
+async def generate_comment(post_text: str) -> str:
+    """Короткий комментарий к посту канала без знаков препинания."""
+    import re
+
+    if state.character:
+        system = (
+            state.character + "\n\n"
+            "Write a short comment in Russian, max 10 words, no punctuation marks at all "
+            "(no dots, commas, exclamation marks, question marks, dashes, quotes). "
+            "React to the post naturally."
+        )
+    else:
+        system = (
+            "Пиши короткие живые комментарии на русском языке под постами в Telegram. "
+            "Максимум одно короткое предложение или фраза — не более 10 слов. "
+            "Никаких знаков препинания: без точек запятых восклицательных и вопросительных знаков тире скобок кавычек. "
+            "Никаких шаблонных фраз. Своё мнение или реакция по теме поста. "
+            "Пиши как живой человек в чате — коротко и по делу."
+        )
+
+    comment = await _groq_call(system, f"Напиши комментарий к посту:\n\n{post_text[:1000]}")
+    comment = re.sub(r'[.!?,;:…\-—–()\[\]{}"\'«»]', '', comment).strip()
+    return comment
+
+
+async def generate_reply(user_text: str) -> str:
+    """Ответ на личное сообщение с учётом характера."""
+    if state.character:
+        system = (
+            state.character + "\n\n"
+            "You are chatting via Telegram. Reply in Russian, naturally and conversationally. "
+            "Keep it brief — 1-3 sentences max."
+        )
+    else:
+        system = (
+            "Ты дружелюбный собеседник в Telegram. "
+            "Отвечай на русском языке — живо, кратко, по делу. "
+            "1-3 предложения максимум."
+        )
+
+    return await _groq_call(system, user_text, max_tokens=200, temperature=0.85)
+
+
+# ── Вступление в канал и группу обсуждений ───────────────────────────────────
+async def join_channel_and_discussion(client, username: str) -> tuple[bool, str]:
+    """
+    Вступает в канал и в его группу обсуждений (linked_chat).
+    Возвращает (успех, описание).
+    """
+    from pyrogram import errors as pyro_errors
+
+    lines = []
+    try:
+        await client.join_chat(username)
+        lines.append(f"вступил в канал @{username}")
+    except pyro_errors.UserAlreadyParticipant:
+        lines.append(f"уже в канале @{username}")
+    except Exception as e:
+        return False, str(e)
+
+    # Получаем linked_chat (группа обсуждений)
+    try:
+        chat = await client.get_chat(username)
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            discussion_id = linked.id
+            try:
+                await client.join_chat(discussion_id)
+                discussion_title = getattr(linked, "title", str(discussion_id))
+                lines.append(f"вступил в чат обсуждений «{discussion_title}»")
+            except pyro_errors.UserAlreadyParticipant:
+                discussion_title = getattr(linked, "title", str(discussion_id))
+                lines.append(f"уже в чате обсуждений «{discussion_title}»")
+            except Exception as e:
+                lines.append(f"не удалось вступить в чат обсуждений: {e}")
+        else:
+            lines.append("группа обсуждений не найдена")
+    except Exception as e:
+        lines.append(f"ошибка получения linked_chat: {e}")
+
+    return True, "\n".join(lines)
 
 
 # ── Обработчик личных сообщений (админ-панель) ────────────────────────────────
@@ -144,17 +219,26 @@ async def handle_admin_message(client, message) -> None:
         await message.reply(MENU)
         return
 
-    # ── Только для авторизованных ──────────────────────────────────────────────
+    # ── Если не в сессии — отвечаем как AI-собеседник ────────────────────────
     if not admin_sessions.get(user_id):
+        if not text:
+            return
+        try:
+            reply = await generate_reply(text)
+            await message.reply(reply)
+        except Exception as e:
+            log.error("generate_reply error: %s", e)
         return
 
     # ── /status ───────────────────────────────────────────────────────────────
     if text == "/status":
         status = "✅ Активен" if state.is_active else "⛔ Остановлен"
         chs = "\n".join(f"  • @{c}" for c in state.channels) or "  (пусто)"
+        char_preview = (state.character[:60] + "…") if state.character and len(state.character) > 60 else (state.character or "не задан")
         await message.reply(
             f"📊 Статус: {status}\n"
             f"⏱ Задержка: {state.min_delay}–{state.max_delay} сек\n"
+            f"🎭 Характер: {char_preview}\n"
             f"📢 Каналы ({len(state.channels)}):\n{chs}"
         )
 
@@ -166,9 +250,16 @@ async def handle_admin_message(client, message) -> None:
         elif ch in state.channels:
             await message.reply(f"⚠️ @{ch} уже есть в списке")
         else:
-            state.channels.append(ch)
-            state.save()
-            await message.reply(f"✅ @{ch} добавлен\nВсего каналов: {len(state.channels)}")
+            await message.reply(f"⏳ Вступаю в @{ch}...")
+            joined, detail = await join_channel_and_discussion(client, ch)
+            if not joined:
+                await message.reply(f"❌ Не удалось вступить в @{ch}: {detail}")
+            else:
+                state.channels.append(ch)
+                state.save()
+                await message.reply(
+                    f"✅ @{ch} добавлен\n{detail}\nВсего каналов: {len(state.channels)}"
+                )
 
     # ── /remove @channel ──────────────────────────────────────────────────────
     elif text.startswith("/remove "):
@@ -228,34 +319,82 @@ async def handle_admin_message(client, message) -> None:
             lines = "\n".join(f"{i + 1}. @{c}" for i, c in enumerate(state.channels))
             await message.reply(f"📋 Каналы ({len(state.channels)}):\n{lines}")
 
+    # ── /character add <prompt> ───────────────────────────────────────────────
+    elif text.startswith("/character add "):
+        prompt = text[15:].strip()
+        if not prompt:
+            await message.reply("❌ Укажите промпт: /character add You are a sarcastic tech blogger")
+        else:
+            state.character = prompt
+            state.save()
+            preview = (prompt[:80] + "…") if len(prompt) > 80 else prompt
+            await message.reply(f"🎭 Характер установлен:\n{preview}")
+
+    # ── /character remove ─────────────────────────────────────────────────────
+    elif text == "/character remove":
+        if not state.character:
+            await message.reply("⚠️ Характер не был задан")
+        else:
+            state.character = None
+            state.save()
+            await message.reply("🎭 Характер сброшен — используется стандартный промпт")
+
     # ── Неизвестная команда → показать меню ───────────────────────────────────
     else:
         await message.reply(MENU)
+
+
+# Кэш: username канала → id группы обсуждений
+_discussion_cache: dict[str, int] = {}
+
+
+async def get_discussion_id(client, channel_username: str) -> int | None:
+    """Возвращает chat_id группы обсуждений для канала (с кэшем)."""
+    if channel_username in _discussion_cache:
+        return _discussion_cache[channel_username]
+    try:
+        chat = await client.get_chat(channel_username)
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            _discussion_cache[channel_username] = linked.id
+            return linked.id
+    except Exception as e:
+        log.error("get_discussion_id @%s: %s", channel_username, e)
+    return None
 
 
 # ── Обработчик постов в каналах ───────────────────────────────────────────────
 async def handle_post(client, message) -> None:
     try:
         chat_username = getattr(message.chat, "username", None)
+        log.info("[пост] chat=%s active=%s channels=%s", chat_username, state.is_active, state.channels)
+
         if not chat_username:
+            log.info("[пост] пропуск — нет username у чата")
             return
         if chat_username.lower() not in state.channels:
+            log.info("[пост] пропуск — канал не в списке")
             return
         if not state.is_active:
+            log.info("[пост] пропуск — комментинг выключен (отправьте /start)")
             return
 
         post_text = message.text or message.caption or ""
         if len(post_text) < 50:
+            log.info("[пост] пропуск — текст слишком короткий (%d симв.)", len(post_text))
             return
 
         delay = random.randint(state.min_delay, state.max_delay)
         log.info("[%s] Новый пост — ждём %d сек...", chat_username, delay)
         await asyncio.sleep(delay)
 
+        # Генерация комментария
         comment: str | None = None
         for attempt in range(2):
             try:
+                log.info("[%s] Запрос к Groq (попытка %d)...", chat_username, attempt + 1)
                 comment = await generate_comment(post_text)
+                log.info("[%s] Groq ответил: %s", chat_username, comment[:80])
                 break
             except Exception as e:
                 log.error("Groq ошибка (попытка %d/2): %s", attempt + 1, e)
@@ -263,20 +402,31 @@ async def handle_post(client, message) -> None:
                     await asyncio.sleep(5)
 
         if not comment:
-            log.error("[%s] Не удалось сгенерировать комментарий — пропуск", chat_username)
+            log.error("[%s] Не удалось получить комментарий — пропуск", chat_username)
             return
 
+        # Отправляем в группу обсуждений как ответ на пост
         from pyrogram import errors as pyro_errors
 
+        discussion_id = await get_discussion_id(client, chat_username)
+        if not discussion_id:
+            log.error("[%s] Группа обсуждений не найдена — пропуск", chat_username)
+            return
+
         try:
-            await message.reply(comment)
+            # reply_to_message_id=message.id работает потому что Telegram
+            # использует одинаковые ID для поста в канале и его копии в обсуждениях
+            await client.send_message(discussion_id, comment, reply_to_message_id=message.id)
         except pyro_errors.FloodWait as e:
             log.warning("FloodWait %d сек — ждём...", e.value)
             await asyncio.sleep(e.value)
-            await message.reply(comment)
+            await client.send_message(discussion_id, comment, reply_to_message_id=message.id)
+        except Exception as e:
+            log.error("[%s] Ошибка отправки в обсуждения: %s", chat_username, e)
+            return
 
         ts = datetime.now().strftime("%H:%M:%S")
-        log.info("[%s] @%s → «%s…»", ts, chat_username, comment[:50])
+        log.info("[%s] @%s → «%s»", ts, chat_username, comment)
 
     except Exception as e:
         log.error("handle_post: неожиданная ошибка — %s", e)
