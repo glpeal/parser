@@ -157,8 +157,9 @@ async def search_telegram(client: Client, query: str, limit: int = 50) -> list[s
     found: list[str] = []
     print(f"  [поиск] Запрос: «{query}», лимит {limit}")
     try:
-        async for chat in client.search_global(query, limit=limit):
-            if chat.type in (ChatType.CHANNEL, ChatType.SUPERGROUP):
+        async for message in client.search_global(query, limit=limit):
+            chat = getattr(message, "chat", None)
+            if chat and chat.type in (ChatType.CHANNEL, ChatType.SUPERGROUP):
                 uname = chat.username.lower() if chat.username else str(chat.id)
                 if uname not in found:
                     found.append(uname)
