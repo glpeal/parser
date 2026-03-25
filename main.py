@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-Telegram Channel Parser
-- Поиск каналов по ключевому слову или через tgstat.ru
-- Фильтрация по наличию комментариев и минимальному числу подписчиков
-- Экспорт папки-приглашения t.me/addlist/...
+Telegram Userbot Auto-Commenter — всё в одном файле
+Автоматически комментирует посты в каналах с помощью Groq AI.
+
+Запуск:
+    pip install -r requirements.txt
+    # заполните .env (API_ID, API_HASH, GROQ_API_KEY)
+    python main.py
+
+При первом запуске Pyrogram запросит номер телефона и код подтверждения.
+Для управления ботом отправьте себе секретный код из ADMIN_CODE —
+откроется панель управления.
 """
 
 import asyncio
@@ -11,443 +18,315 @@ import json
 import logging
 import os
 import random
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
-import aiohttp
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
-# ---------------------------------------------------------------------------
-# Конфиг
-# ---------------------------------------------------------------------------
 
 load_dotenv()
 
-API_ID: int = int(os.getenv("API_ID", "0"))
+# ── Конфиг ───────────────────────────────────────────────────────────────────
+API_ID: int   = int(os.getenv("API_ID", "0"))
 API_HASH: str = os.getenv("API_HASH", "")
-MIN_SUBSCRIBERS: int = int(os.getenv("MIN_SUBSCRIBERS", "1000"))
-MAX_CHANNELS_PER_FOLDER: int = int(os.getenv("MAX_CHANNELS_PER_FOLDER", "200"))
-SESSION_NAME: str = os.getenv("SESSION_NAME", "parser_session")
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
+ADMIN_CODE    = os.getenv("ADMIN_CODE", ".secret123")
+SESSION_NAME  = os.getenv("SESSION_NAME", "commenter_session")
 
-STORAGE_FILE = Path("channels.json")
+STATE_FILE = Path("state.json")
 
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("errors.log", encoding="utf-8")],
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Импорт pyrogram (pyrofork устанавливается в пространство имён pyrogram)
-# ---------------------------------------------------------------------------
+# ── Состояние ─────────────────────────────────────────────────────────────────
+class State:
+    def __init__(self):
+        self.is_active: bool      = False
+        self.channels: list[str]  = []
+        self.admin_id: int | None = None
+        self.min_delay: int       = 30
+        self.max_delay: int       = 120
 
-try:
-    from pyrogram import Client, errors
-    from pyrogram.enums import ChatType
-    from pyrogram.raw import functions, types as raw_types
-except ImportError:
-    print(
-        "Ошибка: библиотека pyrogram не найдена.\n"
-        "Выполните: pip install -r requirements.txt"
-    )
-    sys.exit(1)
+    def save(self):
+        STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "is_active": self.is_active,
+                    "channels":  self.channels,
+                    "admin_id":  self.admin_id,
+                    "min_delay": self.min_delay,
+                    "max_delay": self.max_delay,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-# ---------------------------------------------------------------------------
-# Хранилище channels.json
-# ---------------------------------------------------------------------------
-
-def _load() -> dict:
-    if STORAGE_FILE.exists():
-        try:
-            return json.loads(STORAGE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"last_updated": None, "channels": []}
-
-
-def _save(data: dict) -> None:
-    data["last_updated"] = datetime.now().isoformat()
-    STORAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def upsert_channels(new: list[dict]) -> None:
-    data = _load()
-    index: dict[str, dict] = {ch["username"]: ch for ch in data["channels"]}
-    for ch in new:
-        index[ch["username"]] = ch
-    data["channels"] = list(index.values())
-    _save(data)
-
-
-# ---------------------------------------------------------------------------
-# Парсинг tgstat.ru
-# ---------------------------------------------------------------------------
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-
-async def parse_tgstat(category_url: str, pages: int = 3) -> list[str]:
-    """Возвращает список username с tgstat.ru."""
-    found: list[str] = []
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(headers=_HEADERS, connector=connector) as session:
-        for page in range(1, pages + 1):
-            url = f"{category_url.rstrip('/')}?page={page}"
-            print(f"  [tgstat] Страница {page}: {url}")
+    def load(self):
+        if STATE_FILE.exists():
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                    if resp.status != 200:
-                        print(f"  [tgstat] HTTP {resp.status}, останавливаем.")
-                        break
-                    html = await resp.text()
-            except Exception as exc:
-                log.error("tgstat page %d: %s", page, exc)
-                print(f"  [tgstat] Ошибка: {exc}")
-                break
-
-            soup = BeautifulSoup(html, "html.parser")
-            before = len(found)
-
-            # Основной способ: /channel/@username в href
-            for tag in soup.find_all("a", href=True):
-                m = re.search(r"/channel/@([\w]+)", tag["href"])
-                if m:
-                    uname = m.group(1).lower()
-                    if uname not in found:
-                        found.append(uname)
-
-            # Резервный: @username в тексте страницы
-            if len(found) == before:
-                for text in soup.stripped_strings:
-                    m = re.search(r"@([\w]{5,32})", text)
-                    if m:
-                        uname = m.group(1).lower()
-                        if uname not in found:
-                            found.append(uname)
-
-            added = len(found) - before
-            print(f"  [tgstat] +{added} каналов (всего {len(found)})")
-            if added == 0:
-                print("  [tgstat] Новых нет, останавливаем.")
-                break
-
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-
-    return found
+                d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                self.is_active = d.get("is_active", False)
+                self.channels  = d.get("channels", [])
+                self.admin_id  = d.get("admin_id")
+                self.min_delay = d.get("min_delay", 30)
+                self.max_delay = d.get("max_delay", 120)
+                log.info(
+                    "Состояние загружено: активен=%s, каналов=%d",
+                    self.is_active, len(self.channels),
+                )
+            except Exception as e:
+                log.error("Ошибка загрузки state.json: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Поиск через Telegram
-# ---------------------------------------------------------------------------
+state = State()
 
-async def search_telegram(client: Client, query: str, limit: int = 50) -> list[str]:
-    """Глобальный поиск каналов по ключевому слову."""
-    found: list[str] = []
-    print(f"  [поиск] Запрос: «{query}», лимит {limit}")
+# ── Сессии админ-панели ───────────────────────────────────────────────────────
+admin_sessions: dict[int, bool] = {}
+
+MENU = """🤖 Панель управления
+
+/status — состояние бота
+/add @channel — добавить канал
+/remove @channel — удалить канал
+/start — начать комментинг
+/stop — остановить
+/delay 30 120 — задержка (мин макс секунд)
+/list — список каналов"""
+
+
+# ── Groq: генерация комментария ───────────────────────────────────────────────
+async def generate_comment(post_text: str) -> str:
+    """Генерирует живой комментарий через Groq (llama-3.3-70b-versatile)."""
+    from groq import AsyncGroq
+
+    client = AsyncGroq(api_key=GROQ_API_KEY)
+    resp = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Пиши живые, естественные комментарии на русском языке под постами в Telegram. "
+                    "1–3 предложения. Никаких шаблонных фраз («отличный пост», «спасибо за информацию», «интересно»). "
+                    "Добавляй своё мнение, аргумент или задавай уместный вопрос. "
+                    "Соответствуй тону поста: если пост серьёзный — серьёзно, если лёгкий — живо."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Напиши комментарий к посту:\n\n{post_text[:1000]}",
+            },
+        ],
+        max_tokens=200,
+        temperature=0.8,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# ── Обработчик личных сообщений (админ-панель) ────────────────────────────────
+async def handle_admin_message(client, message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return
+
+    text = (message.text or "").strip()
+
+    # ── Секретный триггер ──────────────────────────────────────────────────────
+    if text == ADMIN_CODE:
+        admin_sessions[user_id] = True
+        state.admin_id = user_id
+        state.save()
+        await message.reply(MENU)
+        return
+
+    # ── Только для авторизованных ──────────────────────────────────────────────
+    if not admin_sessions.get(user_id):
+        return
+
+    # ── /status ───────────────────────────────────────────────────────────────
+    if text == "/status":
+        status = "✅ Активен" if state.is_active else "⛔ Остановлен"
+        chs = "\n".join(f"  • @{c}" for c in state.channels) or "  (пусто)"
+        await message.reply(
+            f"📊 Статус: {status}\n"
+            f"⏱ Задержка: {state.min_delay}–{state.max_delay} сек\n"
+            f"📢 Каналы ({len(state.channels)}):\n{chs}"
+        )
+
+    # ── /add @channel ─────────────────────────────────────────────────────────
+    elif text.startswith("/add "):
+        ch = text[5:].strip().lstrip("@").lower()
+        if not ch:
+            await message.reply("❌ Укажите username канала: /add @channel")
+        elif ch in state.channels:
+            await message.reply(f"⚠️ @{ch} уже есть в списке")
+        else:
+            state.channels.append(ch)
+            state.save()
+            await message.reply(f"✅ @{ch} добавлен\nВсего каналов: {len(state.channels)}")
+
+    # ── /remove @channel ──────────────────────────────────────────────────────
+    elif text.startswith("/remove "):
+        ch = text[8:].strip().lstrip("@").lower()
+        if ch in state.channels:
+            state.channels.remove(ch)
+            state.save()
+            await message.reply(f"✅ @{ch} удалён\nОсталось каналов: {len(state.channels)}")
+        else:
+            await message.reply(f"❌ @{ch} не найден в списке")
+
+    # ── /start ────────────────────────────────────────────────────────────────
+    elif text == "/start":
+        if not state.channels:
+            await message.reply("⚠️ Сначала добавьте каналы: /add @channel")
+        elif state.is_active:
+            await message.reply("⚠️ Комментинг уже запущен")
+        else:
+            state.is_active = True
+            state.save()
+            await message.reply(
+                f"✅ Авто-комментинг запущен\n"
+                f"Каналов в работе: {len(state.channels)}\n"
+                f"Задержка: {state.min_delay}–{state.max_delay} сек"
+            )
+
+    # ── /stop ─────────────────────────────────────────────────────────────────
+    elif text == "/stop":
+        if not state.is_active:
+            await message.reply("⚠️ Комментинг уже остановлен")
+        else:
+            state.is_active = False
+            state.save()
+            await message.reply("⛔ Авто-комментинг остановлен")
+
+    # ── /delay min max ────────────────────────────────────────────────────────
+    elif text.startswith("/delay "):
+        parts = text[7:].strip().split()
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            await message.reply("❌ Формат: /delay 30 120")
+        else:
+            mn, mx = int(parts[0]), int(parts[1])
+            if mn >= mx:
+                await message.reply("❌ Минимум должен быть меньше максимума")
+            elif mn < 5:
+                await message.reply("❌ Минимальная задержка — 5 секунд")
+            else:
+                state.min_delay, state.max_delay = mn, mx
+                state.save()
+                await message.reply(f"✅ Задержка установлена: {mn}–{mx} сек")
+
+    # ── /list ─────────────────────────────────────────────────────────────────
+    elif text == "/list":
+        if not state.channels:
+            await message.reply("📋 Список каналов пуст\nДобавьте: /add @channel")
+        else:
+            lines = "\n".join(f"{i + 1}. @{c}" for i, c in enumerate(state.channels))
+            await message.reply(f"📋 Каналы ({len(state.channels)}):\n{lines}")
+
+    # ── Неизвестная команда → показать меню ───────────────────────────────────
+    else:
+        await message.reply(MENU)
+
+
+# ── Обработчик постов в каналах ───────────────────────────────────────────────
+async def handle_post(client, message) -> None:
     try:
-        async for message in client.search_global(query, limit=limit):
-            chat = getattr(message, "chat", None)
-            if chat and chat.type in (ChatType.CHANNEL, ChatType.SUPERGROUP):
-                uname = chat.username.lower() if chat.username else str(chat.id)
-                if uname not in found:
-                    found.append(uname)
-            await asyncio.sleep(0.05)
-    except errors.FloodWait as exc:
-        print(f"  [поиск] FloodWait {exc.value}с, ждём...")
-        await asyncio.sleep(exc.value)
-    except Exception as exc:
-        log.error("search_telegram: %s", exc)
-        print(f"  [поиск] Ошибка: {exc}")
+        chat_username = getattr(message.chat, "username", None)
+        if not chat_username:
+            return
+        if chat_username.lower() not in state.channels:
+            return
+        if not state.is_active:
+            return
 
-    print(f"  [поиск] Найдено: {len(found)}")
-    return found
+        post_text = message.text or message.caption or ""
+        if len(post_text) < 50:
+            return
 
+        delay = random.randint(state.min_delay, state.max_delay)
+        log.info("[%s] Новый пост — ждём %d сек...", chat_username, delay)
+        await asyncio.sleep(delay)
 
-# ---------------------------------------------------------------------------
-# Проверка каналов (комментарии + подписчики)
-# ---------------------------------------------------------------------------
-
-async def _check_one(client: Client, username: str) -> dict | None:
-    """Проверяет один канал. Возвращает dict или None."""
-    chat = await client.get_chat(username)
-    members = getattr(chat, "members_count", 0) or 0
-    linked = getattr(chat, "linked_chat", None)
-    if members >= MIN_SUBSCRIBERS and linked is not None:
-        return {
-            "username": username,
-            "title": getattr(chat, "title", username),
-            "subscribers": members,
-            "has_comments": True,
-        }
-    return None
-
-
-async def filter_channels(client: Client, usernames: list[str]) -> list[dict]:
-    """Фильтрует каналы по комментариям и подписчикам."""
-    result: list[dict] = []
-    total = len(usernames)
-
-    for idx, uname in enumerate(usernames, 1):
-        print(f"  [{idx}/{total}] @{uname} ...", end=" ", flush=True)
+        comment: str | None = None
         for attempt in range(2):
             try:
-                ch = await _check_one(client, uname)
-                if ch:
-                    print(f"ОК ({ch['subscribers']} подп.)")
-                    result.append(ch)
-                else:
-                    chat = await client.get_chat(uname)
-                    members = getattr(chat, "members_count", 0) or 0
-                    linked = getattr(chat, "linked_chat", None)
-                    if members < MIN_SUBSCRIBERS:
-                        print(f"мало подписчиков ({members})")
-                    else:
-                        print("нет комментариев")
+                comment = await generate_comment(post_text)
                 break
-            except errors.FloodWait as exc:
-                wait = exc.value + 1
-                print(f"FloodWait {wait}с...", end=" ", flush=True)
-                await asyncio.sleep(wait)
-            except errors.UsernameNotOccupied:
-                print("не найден")
-                break
-            except errors.ChannelPrivate:
-                print("приватный")
-                break
-            except errors.UsernameInvalid:
-                print("неверный username")
-                break
-            except Exception as exc:
-                log.error("checker @%s: %s", uname, exc)
-                print(f"ошибка: {exc}")
-                break
+            except Exception as e:
+                log.error("Groq ошибка (попытка %d/2): %s", attempt + 1, e)
+                if attempt == 0:
+                    await asyncio.sleep(5)
 
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        if not comment:
+            log.error("[%s] Не удалось сгенерировать комментарий — пропуск", chat_username)
+            return
 
-    return result
+        from pyrogram import errors as pyro_errors
 
-
-# ---------------------------------------------------------------------------
-# Создание папки-приглашения
-# ---------------------------------------------------------------------------
-
-async def _free_filter_id(client: Client) -> int:
-    try:
-        raw = await client.invoke(functions.messages.GetDialogFilters())
-        # В разных версиях схемы результат — либо объект с .filters, либо список
-        filters = raw.filters if hasattr(raw, "filters") else raw
-        used = {f.id for f in filters if hasattr(f, "id")}
-        for fid in range(2, 256):
-            if fid not in used:
-                return fid
-    except Exception as exc:
-        log.error("_free_filter_id: %s", exc)
-    return 2
-
-
-async def create_folder_invite(client: Client, usernames: list[str], title: str) -> str:
-    """Создаёт папку Telegram и возвращает t.me/addlist/..."""
-    if not usernames:
-        raise ValueError("Список каналов пуст")
-
-    batch = usernames[:MAX_CHANNELS_PER_FOLDER]
-    print(f"  [папка] Резолвим {len(batch)} каналов...")
-
-    peers = []
-    for uname in batch:
         try:
-            peers.append(await client.resolve_peer(uname))
-            await asyncio.sleep(0.2)
-        except Exception as exc:
-            log.error("resolve_peer @%s: %s", uname, exc)
-            print(f"  [папка] Пропуск @{uname}: {exc}")
+            await message.reply(comment)
+        except pyro_errors.FloodWait as e:
+            log.warning("FloodWait %d сек — ждём...", e.value)
+            await asyncio.sleep(e.value)
+            await message.reply(comment)
 
-    if not peers:
-        raise ValueError("Не удалось резолвить ни одного канала")
+        ts = datetime.now().strftime("%H:%M:%S")
+        log.info("[%s] @%s → «%s…»", ts, chat_username, comment[:50])
 
-    fid = await _free_filter_id(client)
-    print(f"  [папка] Создаём фильтр #{fid} «{title}»...")
-
-    dialog_filter = raw_types.DialogFilter(
-        id=fid,
-        title=title,
-        pinned_peers=[],
-        include_peers=peers,
-        exclude_peers=[],
-        contacts=False,
-        non_contacts=False,
-        groups=False,
-        broadcasts=True,
-        bots=False,
-        exclude_muted=False,
-        exclude_read=False,
-        exclude_archived=False,
-    )
-    await client.invoke(
-        functions.messages.UpdateDialogFilter(id=fid, filter=dialog_filter)
-    )
-
-    print("  [папка] Генерируем ссылку...")
-    res = await client.invoke(
-        functions.chatlists.ExportChatlistInvite(
-            chatlist=raw_types.InputChatlistDialogFilter(filter_id=fid),
-            title=title,
-            peers=peers,
-        )
-    )
-    return res.invite.url
+    except Exception as e:
+        log.error("handle_post: неожиданная ошибка — %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Меню
-# ---------------------------------------------------------------------------
-
-def _menu() -> None:
-    print(
-        "\n"
-        "╔══════════════════════════════════════╗\n"
-        "║    Telegram Channel Parser           ║\n"
-        "╠══════════════════════════════════════╣\n"
-        "║  1. Поиск по ключевому слову         ║\n"
-        "║  2. Парсинг с tgstat.ru              ║\n"
-        "║  3. Перепроверить сохранённые каналы ║\n"
-        "║  4. Создать ссылку-приглашение папки ║\n"
-        "║  5. Показать сохранённые каналы      ║\n"
-        "║  6. Выход                            ║\n"
-        "╚══════════════════════════════════════╝"
-    )
-
-
-def _show_table(channels: list[dict]) -> None:
-    if not channels:
-        print("  Список пуст.")
-        return
-    print(f"\n  {'№':<4} {'Username':<28} {'Подписчики':>12}  Назв.")
-    print("  " + "─" * 64)
-    for i, ch in enumerate(channels, 1):
-        mark = "+" if ch.get("has_comments") else " "
-        print(
-            f"  {i:<4} @{ch['username']:<27} {ch['subscribers']:>12}  "
-            f"[{mark}] {ch.get('title','')[:22]}"
-        )
-    print(f"\n  Итого: {len(channels)}  ([+] = есть комментарии)")
-
-
-async def _opt1(client: Client) -> None:
-    q = input("  Ключевое слово: ").strip()
-    if not q:
-        return
-    lim = input("  Лимит (по умолч. 50): ").strip()
-    lim = int(lim) if lim.isdigit() else 50
-    names = await search_telegram(client, q, lim)
-    print(f"\n  Проверяем {len(names)} каналов...")
-    found = await filter_channels(client, names)
-    if found:
-        upsert_channels(found)
-        print(f"  Сохранено: {len(found)}")
-    else:
-        print("  Подходящих не найдено.")
-
-
-async def _opt2(client: Client) -> None:
-    url = input("  URL категории tgstat.ru\n  Пример: https://tgstat.ru/ru/news\n  > ").strip()
-    if not url:
-        return
-    pg = input("  Страниц (по умолч. 3): ").strip()
-    pg = int(pg) if pg.isdigit() else 3
-    names = await parse_tgstat(url, pg)
-    print(f"\n  Проверяем {len(names)} каналов...")
-    found = await filter_channels(client, names)
-    if found:
-        upsert_channels(found)
-        print(f"  Сохранено: {len(found)}")
-    else:
-        print("  Подходящих не найдено.")
-
-
-async def _opt3(client: Client) -> None:
-    data = _load()
-    chs = data.get("channels", [])
-    if not chs:
-        print("  Нет сохранённых каналов.")
-        return
-    names = [ch["username"] for ch in chs]
-    print(f"\n  Перепроверяем {len(names)} каналов...")
-    found = await filter_channels(client, names)
-    upsert_channels(found)
-    print(f"  Обновлено: {len(found)}")
-
-
-async def _opt4(client: Client) -> None:
-    data = _load()
-    chs = [ch for ch in data.get("channels", []) if ch.get("has_comments")]
-    if not chs:
-        print("  Нет каналов с комментариями в сохранённых.")
-        return
-    print(f"  Доступно {len(chs)} каналов.")
-    title = input("  Название папки: ").strip() or "Мои каналы"
-    names = [ch["username"] for ch in chs]
-    try:
-        link = await create_folder_invite(client, names, title)
-        print(f"\n  Ссылка готова:\n  {link}")
-    except Exception as exc:
-        log.error("create_folder_invite: %s", exc)
-        print(f"  Ошибка: {exc}")
-
-
-def _opt5() -> None:
-    data = _load()
-    print(f"\n  Обновлено: {data.get('last_updated', '—')}")
-    _show_table(data.get("channels", []))
-
-
-# ---------------------------------------------------------------------------
-# Точка входа
-# ---------------------------------------------------------------------------
-
+# ── Точка входа ───────────────────────────────────────────────────────────────
 async def main() -> None:
+    errors = []
     if not API_ID or not API_HASH:
-        print(
-            "Ошибка: заполните API_ID и API_HASH в файле .env\n"
-            "Данные берутся на https://my.telegram.org -> API development tools"
-        )
+        errors.append("API_ID и API_HASH — получить на https://my.telegram.org → API development tools")
+    if not GROQ_API_KEY:
+        errors.append("GROQ_API_KEY — получить на https://console.groq.com")
+    if errors:
+        print("❌ Не заполнены обязательные переменные в .env:")
+        for e in errors:
+            print(f"   • {e}")
         sys.exit(1)
 
-    print("Подключение к Telegram...")
-    async with Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH) as client:
-        me = await client.get_me()
-        print(f"Вошли как: {me.first_name} (@{me.username})\n")
+    state.load()
 
-        while True:
-            _menu()
-            choice = input("  Выбор [1-6]: ").strip()
-            if choice == "1":
-                await _opt1(client)
-            elif choice == "2":
-                await _opt2(client)
-            elif choice == "3":
-                await _opt3(client)
-            elif choice == "4":
-                await _opt4(client)
-            elif choice == "5":
-                _opt5()
-            elif choice == "6":
-                print("  Выход.")
-                break
-            else:
-                print("  Неверный ввод.")
+    from pyrogram import Client, filters
+
+    app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+
+    @app.on_message(filters.private)
+    async def _on_private(client, message):
+        await handle_admin_message(client, message)
+
+    @app.on_message(filters.channel)
+    async def _on_channel(client, message):
+        await handle_post(client, message)
+
+    print("=" * 52)
+    print("  Telegram Userbot Auto-Commenter")
+    print("=" * 52)
+
+    async with app:
+        me = await app.get_me()
+        print(f"  Аккаунт : {me.first_name} (@{me.username})")
+        print(f"  Статус  : {'✅ активен' if state.is_active else '⛔ остановлен'}")
+        print(f"  Каналов : {len(state.channels)}")
+        print(f"  Задержка: {state.min_delay}–{state.max_delay} сек")
+        print(f"  Триггер : отправьте «{ADMIN_CODE}» себе для панели управления")
+        print("=" * 52)
+        print("  Для остановки нажмите Ctrl+C")
+
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\n  Остановка...")
 
 
 if __name__ == "__main__":
