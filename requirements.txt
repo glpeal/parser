@@ -1,5 +1,4 @@
 pyrofork
-tgcrypto
 aiohttp
 beautifulsoup4
 python-dotenv
