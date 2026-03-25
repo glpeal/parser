@@ -285,29 +285,57 @@ async def handle_admin_message(client, message) -> None:
         await message.reply(MENU)
 
 
+# Кэш: username канала → id группы обсуждений
+_discussion_cache: dict[str, int] = {}
+
+
+async def get_discussion_id(client, channel_username: str) -> int | None:
+    """Возвращает chat_id группы обсуждений для канала (с кэшем)."""
+    if channel_username in _discussion_cache:
+        return _discussion_cache[channel_username]
+    try:
+        chat = await client.get_chat(channel_username)
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            _discussion_cache[channel_username] = linked.id
+            return linked.id
+    except Exception as e:
+        log.error("get_discussion_id @%s: %s", channel_username, e)
+    return None
+
+
 # ── Обработчик постов в каналах ───────────────────────────────────────────────
 async def handle_post(client, message) -> None:
     try:
         chat_username = getattr(message.chat, "username", None)
+        log.info("[пост] chat=%s active=%s channels=%s", chat_username, state.is_active, state.channels)
+
         if not chat_username:
+            log.info("[пост] пропуск — нет username у чата")
             return
         if chat_username.lower() not in state.channels:
+            log.info("[пост] пропуск — канал не в списке")
             return
         if not state.is_active:
+            log.info("[пост] пропуск — комментинг выключен (отправьте /start)")
             return
 
         post_text = message.text or message.caption or ""
         if len(post_text) < 50:
+            log.info("[пост] пропуск — текст слишком короткий (%d симв.)", len(post_text))
             return
 
         delay = random.randint(state.min_delay, state.max_delay)
         log.info("[%s] Новый пост — ждём %d сек...", chat_username, delay)
         await asyncio.sleep(delay)
 
+        # Генерация комментария
         comment: str | None = None
         for attempt in range(2):
             try:
+                log.info("[%s] Запрос к Groq (попытка %d)...", chat_username, attempt + 1)
                 comment = await generate_comment(post_text)
+                log.info("[%s] Groq ответил: %s", chat_username, comment[:80])
                 break
             except Exception as e:
                 log.error("Groq ошибка (попытка %d/2): %s", attempt + 1, e)
@@ -315,20 +343,31 @@ async def handle_post(client, message) -> None:
                     await asyncio.sleep(5)
 
         if not comment:
-            log.error("[%s] Не удалось сгенерировать комментарий — пропуск", chat_username)
+            log.error("[%s] Не удалось получить комментарий — пропуск", chat_username)
             return
 
+        # Отправляем в группу обсуждений как ответ на пост
         from pyrogram import errors as pyro_errors
 
+        discussion_id = await get_discussion_id(client, chat_username)
+        if not discussion_id:
+            log.error("[%s] Группа обсуждений не найдена — пропуск", chat_username)
+            return
+
         try:
-            await message.reply(comment)
+            # reply_to_message_id=message.id работает потому что Telegram
+            # использует одинаковые ID для поста в канале и его копии в обсуждениях
+            await client.send_message(discussion_id, comment, reply_to_message_id=message.id)
         except pyro_errors.FloodWait as e:
             log.warning("FloodWait %d сек — ждём...", e.value)
             await asyncio.sleep(e.value)
-            await message.reply(comment)
+            await client.send_message(discussion_id, comment, reply_to_message_id=message.id)
+        except Exception as e:
+            log.error("[%s] Ошибка отправки в обсуждения: %s", chat_username, e)
+            return
 
         ts = datetime.now().strftime("%H:%M:%S")
-        log.info("[%s] @%s → «%s…»", ts, chat_username, comment[:50])
+        log.info("[%s] @%s → «%s»", ts, chat_username, comment)
 
     except Exception as e:
         log.error("handle_post: неожиданная ошибка — %s", e)
